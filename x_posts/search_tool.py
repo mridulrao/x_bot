@@ -1,677 +1,330 @@
 from __future__ import annotations
 
+import json
 import os
-import time
+import sys
+import re
+from typing import Optional
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Sequence, Type, TypeVar, Union
+from typing import Any, Dict, Optional, Literal
+from urllib.parse import urlparse
 
-from dotenv import load_dotenv
+from integrations.firecrawl import FirecrawlTool, ToolResult
 
-# Firecrawl v2 SDK (scrape/search/crawl/map/etc.)
-from firecrawl import Firecrawl
 
-# FirecrawlApp is still the class shown in Agent docs/examples.
-# (Depending on your installed SDK version, FirecrawlApp may be available.)
-try:
-    from firecrawl import FirecrawlApp  # type: ignore
-except Exception:  # pragma: no cover
-    FirecrawlApp = None  # type: ignore
+# -------------------------
+# helpers
+# -------------------------
 
-load_dotenv()
+def _clip(s: Optional[str], n: int) -> Optional[str]:
+    if s is None:
+        return None
+    return s if len(s) <= n else s[:n]
 
-T = TypeVar("T")
 
+def _is_http_url(url: str) -> bool:
+    try:
+        p = urlparse(url)
+        return p.scheme in ("http", "https") and bool(p.netloc)
+    except Exception:
+        return False
+
+def clean_markdown_content(md: Optional[str]) -> Optional[str]:
+    """
+    Heuristic markdown cleaner focused on "page chrome" (Medium/nav/footer).
+    Works on markdown output from Firecrawl.
+
+    Goals:
+    - Keep article body
+    - Remove top nav / sign-in / sitemap / app prompts
+    - Remove footer junk
+    - Keep headings, paragraphs, code blocks
+    """
+    if md is None:
+        return None
+
+    s = md.strip()
+
+    # 1) If we have an H1 ("# ..."), drop everything before the first H1.
+    # Medium pages usually include tons of nav before the title.
+    m = re.search(r"(?m)^\#\s+.+$", s)
+    if m:
+        s = s[m.start():].lstrip()
+
+    # 2) Remove obvious boilerplate lines (case-insensitive, whole-line-ish)
+    drop_line_patterns = [
+        r"(?im)^\[sitemap\]\(.+\)\s*$",
+        r"(?im)^\[open in app\]\(.+\)\s*$",
+        r"(?im)^sign up\s*$",
+        r"(?im)^\[sign in\]\(.+\)\s*$",
+        r"(?im)^\[write\]\(.+\)\s*$",
+        r"(?im)^\[search\]\(.+\)\s*$",
+        r"(?im)^listen\s*$",
+        r"(?im)^share\s*$",
+        r"(?im)^\[medium logo\]\(.+\)\s*$",
+    ]
+    for pat in drop_line_patterns:
+        s = re.sub(pat, "", s)
+
+    # 3) Remove image-only lines like: ![](https://...)
+    s = re.sub(r"(?m)^\!\[\]\([^)]+\)\s*$", "", s)
+
+    # 4) Remove common Medium subscription/footer blocks
+    #    (kept as broad multi-line removals)
+    footer_block_patterns = [
+        r"(?is)##\s+get\s+.*?inbox.*?(?:\n{2,}|\Z)",  # "Get X’s stories in your inbox"
+        r"(?is)##\s+no\s+responses\s+yet.*?(?:\n{2,}|\Z)",
+        r"(?is)^help\s*$.*\Z",  # often footer starts with Help/Status/About etc. (aggressive)
+    ]
+    for pat in footer_block_patterns:
+        s = re.sub(pat, "", s).strip()
+
+    # 5) Collapse excessive blank lines
+    s = re.sub(r"\n{3,}", "\n\n", s).strip()
+
+    return s
+
+
+def flatten_markdown_prose(md: Optional[str]) -> Optional[str]:
+    if md is None:
+        return None
+
+    lines = md.splitlines()
+    out = []
+    in_code = False
+    buffer = []
+
+    def flush_buffer():
+        if buffer:
+            # join prose lines into one sentence
+            out.append(" ".join(buffer).strip())
+            buffer.clear()
+
+    for line in lines:
+        stripped = line.strip()
+
+        # Toggle code block
+        if stripped.startswith("```"):
+            flush_buffer()
+            in_code = not in_code
+            out.append(line)  # keep fence
+            continue
+
+        if in_code:
+            out.append(line)  # keep code as-is
+            continue
+
+        # Empty line → paragraph boundary
+        if not stripped:
+            flush_buffer()
+            continue
+
+        # Headings: keep but flatten
+        if stripped.startswith("#"):
+            flush_buffer()
+            out.append(stripped)
+            continue
+
+        buffer.append(stripped)
+
+    flush_buffer()
+
+    return "\n".join(out)
+
+
+
+# -------------------------
+# response wrapper
+# -------------------------
 
 @dataclass
-class ToolResult:
+class LLMToolResponse:
     ok: bool
     data: Any = None
-    error: Optional[str] = None
-    exc_type: Optional[str] = None
+    error: Optional[Dict[str, Any]] = None
 
-    @staticmethod
-    def success(data: Any) -> "ToolResult":
-        return ToolResult(ok=True, data=data)
-
-    @staticmethod
-    def fail(msg: str, exc: Optional[BaseException] = None) -> "ToolResult":
-        return ToolResult(
-            ok=False,
-            data=None,
-            error=msg,
-            exc_type=type(exc).__name__ if exc else None,
-        )
-
-
-class FirecrawlTool:
-    """
-    Thin, testable wrapper over Firecrawl SDK.
-
-    Canonical agent-facing tools:
-      - search_tool(query, ...) : web search; optionally scrape results for content
-      - lookup_tool(url, ...)   : scrape a specific URL for main content
-    """
-
-    def __init__(
-        self,
-        api_key: Optional[str] = None,
-        *,
-        client: Optional[Firecrawl] = None,
-        app: Optional[Any] = None,  # FirecrawlApp
-    ) -> None:
-        api_key = api_key or os.getenv("FIRECRAWL_API_KEY")
-        if not api_key and client is None:
-            raise ValueError(
-                "Missing Firecrawl API key. Provide api_key=... or set FIRECRAWL_API_KEY."
-            )
-
-        self.client: Firecrawl = client or Firecrawl(api_key=api_key)
-
-        # Agent is documented with FirecrawlApp; keep it optional so your code works even if not installed.
-        if app is not None:
-            self.app = app
-        elif FirecrawlApp is not None and api_key:
-            self.app = FirecrawlApp(api_key=api_key)  # type: ignore
-        else:
-            self.app = None
-
-    # ============================================================
-    # Core conversion helper
-    # ============================================================
-
-    def _to_dict(self, x: Any) -> Any:
-        """
-        Convert Firecrawl SDK return types to plain Python objects.
-        """
-        if x is None:
-            return None
-        if isinstance(x, dict):
-            return {k: self._to_dict(v) for k, v in x.items()}
-        if isinstance(x, (list, tuple)):
-            return [self._to_dict(v) for v in x]
-        if hasattr(x, "model_dump"):  # pydantic v2
-            return self._to_dict(x.model_dump())
-        if hasattr(x, "dict"):  # pydantic v1
-            return self._to_dict(x.dict())
-        if hasattr(x, "__dict__"):
-            return self._to_dict(dict(x.__dict__))
-        return x
-
-    # ============================================================
-    # Scrape payload normalization (handles SDK/version response shapes)
-    # ============================================================
-
-    def _extract_scrape_payload(self, raw: Any) -> Dict[str, Any]:
-        """
-        Normalize Firecrawl scrape responses to a stable shape:
-
-          {
-            "data": {...formats...} | None,
-            "metadata": {...} | None,
-            "raw": <original dict-safe payload>
-          }
-
-        Some SDK/version combos return:
-          A) {"success": bool, "data": {...}, "metadata": {...}}
-        Others surface formats at the top-level:
-          B) {"markdown": "...", "metadata": {...}, ...}
-
-        This is *not* site-specific; it's only response-shape normalization.
-        """
-        raw_obj = raw if isinstance(raw, dict) else {"value": raw}
-
-        # Preferred: "data" holds the formats
-        data_obj = raw_obj.get("data")
-        metadata_obj = raw_obj.get("metadata")
-
-        if isinstance(data_obj, dict):
-            return {
-                "data": data_obj,
-                "metadata": metadata_obj if isinstance(metadata_obj, dict) else None,
-                "raw": raw_obj,
-            }
-
-        # Fallback: formats at top-level
-        known_format_keys = (
-            "markdown",
-            "html",
-            "rawHtml",
-            "raw_html",
-            "links",
-            "images",
-            "screenshot",
-            "json",
-            "summary",
-            "actions",
-            "warning",
-            "change_tracking",
-            "branding",
-        )
-
-        extracted: Dict[str, Any] = {}
-        for k in known_format_keys:
-            if k in raw_obj and raw_obj.get(k) is not None:
-                extracted[k] = raw_obj.get(k)
-
+    def to_dict(self) -> Dict[str, Any]:
         return {
-            "data": extracted or None,
-            "metadata": metadata_obj if isinstance(metadata_obj, dict) else None,
-            "raw": raw_obj,
+            "ok": self.ok,
+            "data": self.data,
+            "error": self.error,
         }
 
-    # ============================================================
-    # TWO CANONICAL "AGENT TOOLS"
-    # ============================================================
 
-    def search_tool(
-        self,
-        query: str,
-        *,
-        limit: int = 5,
-        include_content: bool = False,
-        content_formats: Optional[List[str]] = None,
-        only_main_content: bool = True,
-        timeout_ms: int = 60000,
-        normalize: bool = True,
-        **kwargs: Any,
-    ) -> ToolResult:
-        """
-        AGENT TOOL #1: google-like search.
+# -------------------------
+# LLM-facing tools
+# -------------------------
 
-        If include_content=True, passes scrape_options so Firecrawl will scrape each search result and
-        return content (markdown/html/etc.) along with url/title/description.
+class FirecrawlLLMTools:
+    """
+    LLM-facing facade over FirecrawlTool.
+    Output is intentionally small + stable.
+    """
 
-        Returns:
-          normalize=True: {"query","limit","results":[...],"raw":...}
-          normalize=False: dict-safe raw payload
-        """
-        if not query or not query.strip():
-            return ToolResult.fail("search_tool: query is empty")
+    def __init__(self, fc: FirecrawlTool) -> None:
+        self.fc = fc
 
-        try:
-            scrape_options = None
-            if include_content:
-                if content_formats is None:
-                    content_formats = ["markdown"]
-                scrape_options = {
-                    "formats": content_formats,
-                    "only_main_content": bool(only_main_content),
-                    "timeout": int(timeout_ms),
-                }
+    def web_search(self, query: str, *, k: int = 5) -> Dict[str, Any]:
+        if not query.strip():
+            return LLMToolResponse(
+                False,
+                None,
+                {"message": "query is empty", "type": "BadInput"},
+            ).to_dict()
 
-            raw = self.client.search(
-                query=query,
-                limit=int(limit),
-                scrape_options=scrape_options,
-                **kwargs,
-            )
-            raw_obj = self._to_dict(raw)
+        r: ToolResult = self.fc.search_tool(
+            query,
+            limit=k,
+            include_content=False,
+            normalize=True,
+        )
 
-            if not normalize:
-                return ToolResult.success(raw_obj)
+        if not r.ok:
+            return LLMToolResponse(
+                False,
+                None,
+                {"message": r.error or "search failed", "type": r.exc_type},
+            ).to_dict()
 
-            results = self._normalize_search_results(raw_obj)
-            return ToolResult.success(
+        payload = r.data if isinstance(r.data, dict) else {}
+        results = payload.get("results", [])
+
+        slim = []
+        for it in results:
+            if not isinstance(it, dict):
+                continue
+            url = it.get("url")
+            if not url or not _is_http_url(url):
+                continue
+            slim.append(
                 {
-                    "query": query,
-                    "limit": int(limit),
-                    "include_content": bool(include_content),
-                    "results": results,
-                    "raw": raw_obj,
+                    "title": it.get("title"),
+                    "url": url,
+                    "snippet": it.get("description"),
                 }
             )
-        except Exception as e:
-            return ToolResult.fail(f"Firecrawl search_tool failed for query={query!r}", e)
 
-    def lookup_tool(
+        return LLMToolResponse(True, {"results": slim}, None).to_dict()
+
+    def web_fetch(
         self,
         url: str,
         *,
-        formats: Optional[List[str]] = None,
+        format: Literal["markdown", "html", "text"] = "markdown",
+        max_chars: int = 4000,
         only_main_content: bool = True,
         timeout_ms: int = 120000,
-        normalize: bool = True,
-        **kwargs: Any,
-    ) -> ToolResult:
-        """
-        AGENT TOOL #2: Scrape a specific URL.
-        Default: markdown only_main_content.
+    ) -> Dict[str, Any]:
+        if not _is_http_url(url):
+            return LLMToolResponse(
+                False,
+                None,
+                {"message": "invalid url", "type": "BadInput"},
+            ).to_dict()
 
-        NOTE:
-        - This method is a primitive. It does NOT contain any site-specific logic.
-        - It only normalizes Firecrawl's response shape so agents can reliably read `data["markdown"]`.
-        """
-        if not url or not url.strip():
-            return ToolResult.fail("lookup_tool: url is empty")
-
-        if formats is None:
-            formats = ["markdown"]
-
-        res = self.scrape(
+        r: ToolResult = self.fc.lookup_tool(
             url,
-            formats=formats,
+            formats=[format],
             only_main_content=only_main_content,
             timeout_ms=timeout_ms,
-            **kwargs,
-        )
-        if not res.ok or not normalize:
-            return res
-
-        payload = self._extract_scrape_payload(res.data)
-
-        return ToolResult.success(
-            {
-                "url": url,
-                "data": payload["data"],
-                "metadata": payload["metadata"],
-                "raw": payload["raw"],
-            }
+            normalize=True,
         )
 
-    # ============================================================
-    # Normalizers
-    # ============================================================
+        if not r.ok:
+            return LLMToolResponse(
+                False,
+                None,
+                {"message": r.error or "fetch failed", "type": r.exc_type},
+            ).to_dict()
 
-    def _normalize_search_results(self, raw: Any) -> List[Dict[str, Any]]:
-        """
-        Best-effort normalization for Firecrawl Search.
+        data = r.data if isinstance(r.data, dict) else {}
 
-        Output per item:
-          {
-            "title": str | None,
-            "url": str | None,
-            "description": str | None,
-            "content": { "markdown": ..., "html": ..., ... } | None,
-            "source": "firecrawl",
-            "extra": {...}
-          }
-        """
-        items: List[Any] = []
+        # title: try common places
+        title = None
+        if isinstance(data.get("metadata"), dict):
+            title = data["metadata"].get("title")
+        if not title and isinstance(data.get("data"), dict) and isinstance(data["data"].get("metadata"), dict):
+            title = data["data"]["metadata"].get("title")
 
-        if isinstance(raw, dict):
-            # common shapes: {"web":[...]} or {"data":{"web":[...]}} etc.
-            if isinstance(raw.get("web"), list):
-                items = raw["web"]
-            elif isinstance(raw.get("data"), dict) and isinstance(raw["data"].get("web"), list):
-                items = raw["data"]["web"]
-            else:
-                for k in ("results", "items"):
-                    v = raw.get(k)
-                    if isinstance(v, list):
-                        items = v
-                        break
-        elif isinstance(raw, list):
-            items = raw
+        def pick_content(d: Dict[str, Any], fmt: str) -> Optional[str]:
+            # Most common normalized shape from your lookup_tool(normalize=True)
+            if isinstance(d.get("data"), dict):
+                v = d["data"].get(fmt)
+                if isinstance(v, str) and v.strip():
+                    return v
 
-        normalized: List[Dict[str, Any]] = []
-        for it in items:
-            it = it if isinstance(it, dict) else {"value": it}
+            # Some shapes keep content under raw
+            if isinstance(d.get("raw"), dict):
+                v = d["raw"].get(fmt)
+                if isinstance(v, str) and v.strip():
+                    return v
 
-            # v2 search results often include "metadata": {"title","url","description",...}
-            md = it.get("metadata") if isinstance(it.get("metadata"), dict) else {}
+            # Sometimes nested: {"data": {"data": {"markdown": ...}}}
+            if isinstance(d.get("data"), dict) and isinstance(d["data"].get("data"), dict):
+                v = d["data"]["data"].get(fmt)
+                if isinstance(v, str) and v.strip():
+                    return v
 
-            url = (
-                md.get("url")
-                or it.get("url")
-                or it.get("link")
-                or it.get("href")
-                or md.get("source_url")
-            )
-            title = md.get("title") or it.get("title") or it.get("name")
-            desc = md.get("description") or it.get("description") or it.get("snippet") or it.get("summary")
+            # Last resort: top-level
+            v = d.get(fmt)
+            if isinstance(v, str) and v.strip():
+                return v
 
-            # Pull content fields if present
-            content: Dict[str, Any] = {}
-            for k in ("markdown", "html", "rawHtml", "raw_html", "links", "images", "screenshot", "json", "summary"):
-                if k in it and it.get(k) is not None:
-                    content[k] = it.get(k)
+            return None
 
-            # Extra: remove known keys to keep extra small-ish
-            extra = dict(it)
-            for k in (
-                "metadata",
-                "markdown",
-                "html",
-                "rawHtml",
-                "raw_html",
-                "links",
-                "images",
-                "screenshot",
-                "json",
-                "summary",
-            ):
-                extra.pop(k, None)
+        content = pick_content(data, format)
 
-            normalized.append(
-                {
-                    "title": title,
-                    "url": url,
-                    "description": desc,
-                    "content": content or None,
-                    "source": "firecrawl",
-                    "extra": extra,
-                }
-            )
+        if format == "markdown" and isinstance(content, str):
+            content = clean_markdown_content(content)
 
-        return normalized
+        return LLMToolResponse(
+            True,
+            {"url": url, "title": title, "content": _clip(content, int(max_chars))},
+            None,
+        ).to_dict()
 
-    # ============================================================
-    # Scrape / Crawl / Map / Batch / Raw Search
-    # ============================================================
 
-    def scrape(
-        self,
-        url: str,
-        *,
-        formats: Optional[List[str]] = None,
-        only_main_content: Optional[bool] = None,
-        timeout_ms: Optional[int] = None,
-        **kwargs: Any,
-    ) -> ToolResult:
-        """
-        Scrape a single URL.
-        """
-        if not url or not url.strip():
-            return ToolResult.fail("scrape: url is empty")
 
-        try:
-            params: Dict[str, Any] = {}
-            if formats is not None:
-                params["formats"] = formats
-            if only_main_content is not None:
-                params["only_main_content"] = only_main_content
-            if timeout_ms is not None:
-                params["timeout"] = int(timeout_ms)
-            params.update(kwargs)
+# -------------------------
+# HARD-CODED MAIN
+# -------------------------
 
-            data = self.client.scrape(url, **params)
-            return ToolResult.success(self._to_dict(data))
-        except Exception as e:
-            return ToolResult.fail(f"Firecrawl scrape failed for url={url!r}", e)
+def main() -> int:
+    """
+    Hard-coded execution so you can inspect:
+    - web_search output
+    - web_fetch output
+    and judge LLM suitability.
+    """
 
-    def crawl(
-        self,
-        url: str,
-        *,
-        limit: Optional[int] = None,
-        scrape_options: Optional[Dict[str, Any]] = None,
-        sitemap: Optional[str] = None,
-        poll_interval: Optional[int] = None,
-        timeout_s: Optional[int] = None,
-        **kwargs: Any,
-    ) -> ToolResult:
-        try:
-            params: Dict[str, Any] = {"url": url}
-            if limit is not None:
-                params["limit"] = int(limit)
-            if scrape_options is not None:
-                params["scrape_options"] = scrape_options
-            if sitemap is not None:
-                params["sitemap"] = sitemap
-            if poll_interval is not None:
-                params["poll_interval"] = int(poll_interval)
-            if timeout_s is not None:
-                params["timeout"] = int(timeout_s)
-            params.update(kwargs)
+    api_key = os.getenv("FIRECRAWL_API_KEY")
+    fc = FirecrawlTool(api_key=api_key)
+    tools = FirecrawlLLMTools(fc)
 
-            data = self.client.crawl(**params)
-            return ToolResult.success(self._to_dict(data))
-        except Exception as e:
-            return ToolResult.fail(f"Firecrawl crawl failed for url={url!r}", e)
+    # -------------------------
+    # HARD-CODED INPUTS
+    # -------------------------
 
-    def start_crawl(self, url: str, *, limit: Optional[int] = None, **kwargs: Any) -> ToolResult:
-        try:
-            params: Dict[str, Any] = {"url": url}
-            if limit is not None:
-                params["limit"] = int(limit)
-            params.update(kwargs)
-            data = self.client.start_crawl(**params)
-            return ToolResult.success(self._to_dict(data))
-        except Exception as e:
-            return ToolResult.fail(f"Firecrawl start_crawl failed for url={url!r}", e)
+    SEARCH_QUERY = "current trending cryptocurrencies"
+    FETCH_URL = "https://www.reddit.com/r/AI_Agents/comments/1qojw8w/working_as_ai_engineer_is_wild/"
 
-    def get_crawl_status(self, crawl_id: str, **kwargs: Any) -> ToolResult:
-        try:
-            data = self.client.get_crawl_status(crawl_id, **kwargs)
-            return ToolResult.success(self._to_dict(data))
-        except Exception as e:
-            return ToolResult.fail(f"Firecrawl get_crawl_status failed for id={crawl_id!r}", e)
+    print("\n=== LLM TOOL: web_search ===")
+    search_out = tools.web_search(
+        query=SEARCH_QUERY,
+        k=int(os.getenv("SEARCH_TOOL_MAX_RESULTS", "5")),
+    )
+    print(json.dumps(search_out, indent=2, ensure_ascii=False))
 
-    def cancel_crawl(self, crawl_id: str) -> ToolResult:
-        try:
-            data = self.client.cancel_crawl(crawl_id)
-            return ToolResult.success(self._to_dict(data))
-        except Exception as e:
-            return ToolResult.fail(f"Firecrawl cancel_crawl failed for id={crawl_id!r}", e)
+    print("\n=== LLM TOOL: web_fetch ===")
+    fetch_out = tools.web_fetch(
+        url=FETCH_URL,
+        format="markdown",
+        max_chars=int(os.getenv("SEARCH_TOOL_MAX_CHARS", "4000")),
+    )
+    print(json.dumps(fetch_out, indent=2, ensure_ascii=False))
 
-    def get_crawl_status_page(self, next_url: str) -> ToolResult:
-        try:
-            data = self.client.get_crawl_status_page(next_url)
-            return ToolResult.success(self._to_dict(data))
-        except Exception as e:
-            return ToolResult.fail("Firecrawl get_crawl_status_page failed", e)
+    return 0
 
-    def map(self, url: str, *, limit: Optional[int] = None, **kwargs: Any) -> ToolResult:
-        try:
-            params: Dict[str, Any] = {"url": url}
-            if limit is not None:
-                params["limit"] = int(limit)
-            params.update(kwargs)
-            data = self.client.map(**params)
-            return ToolResult.success(self._to_dict(data))
-        except Exception as e:
-            return ToolResult.fail(f"Firecrawl map failed for url={url!r}", e)
 
-    def search(self, query: str, *, limit: Optional[int] = None, **kwargs: Any) -> ToolResult:
-        """Raw Firecrawl search (kept for backward-compat)."""
-        try:
-            params: Dict[str, Any] = {"query": query}
-            if limit is not None:
-                params["limit"] = int(limit)
-            params.update(kwargs)
-            data = self.client.search(**params)
-            return ToolResult.success(self._to_dict(data))
-        except Exception as e:
-            return ToolResult.fail(f"Firecrawl search failed for query={query!r}", e)
-
-    def batch_scrape(
-        self,
-        urls: Sequence[str],
-        *,
-        formats: Optional[List[str]] = None,
-        poll_interval: Optional[int] = None,
-        wait_timeout: Optional[int] = None,
-        **kwargs: Any,
-    ) -> ToolResult:
-        try:
-            params: Dict[str, Any] = {}
-            if formats is not None:
-                params["formats"] = formats
-            if poll_interval is not None:
-                params["poll_interval"] = int(poll_interval)
-            if wait_timeout is not None:
-                params["wait_timeout"] = int(wait_timeout)
-            params.update(kwargs)
-
-            data = self.client.batch_scrape(list(urls), **params)
-            return ToolResult.success(self._to_dict(data))
-        except Exception as e:
-            return ToolResult.fail("Firecrawl batch_scrape failed", e)
-
-    def start_batch_scrape(
-        self,
-        urls: Sequence[str],
-        *,
-        formats: Optional[List[str]] = None,
-        **kwargs: Any,
-    ) -> ToolResult:
-        try:
-            params: Dict[str, Any] = {}
-            if formats is not None:
-                params["formats"] = formats
-            params.update(kwargs)
-
-            data = self.client.start_batch_scrape(list(urls), **params)
-            return ToolResult.success(self._to_dict(data))
-        except Exception as e:
-            return ToolResult.fail("Firecrawl start_batch_scrape failed", e)
-
-    def get_batch_scrape_status(self, batch_id: str, **kwargs: Any) -> ToolResult:
-        try:
-            data = self.client.get_batch_scrape_status(batch_id, **kwargs)
-            return ToolResult.success(self._to_dict(data))
-        except Exception as e:
-            return ToolResult.fail(f"Firecrawl get_batch_scrape_status failed for id={batch_id!r}", e)
-
-    def get_batch_scrape_status_page(self, next_url: str) -> ToolResult:
-        try:
-            data = self.client.get_batch_scrape_status_page(next_url)
-            return ToolResult.success(self._to_dict(data))
-        except Exception as e:
-            return ToolResult.fail("Firecrawl get_batch_scrape_status_page failed", e)
-
-    # ============================================================
-    # Agent (FirecrawlApp-based, per docs)
-    # ============================================================
-
-    def agent_tool(
-        self,
-        prompt: str,
-        *,
-        urls: Optional[Sequence[str]] = None,
-        model: Optional[str] = None,
-        schema: Optional[Union[Type[T], Dict[str, Any]]] = None,
-        timeout_s: int = 180,
-        poll_interval_s: float = 2.0,
-        **kwargs: Any,
-    ) -> ToolResult:
-        """
-        Agent mode (search + navigate + extract).
-
-        - schema is OPTIONAL.
-        - If you want non-blocking control, we do start_agent + poll get_agent_status.
-        """
-        if not prompt or not prompt.strip():
-            return ToolResult.fail("agent_tool: prompt is empty")
-        if self.app is None:
-            return ToolResult.fail(
-                "agent_tool: FirecrawlApp is not available in this environment. "
-                "Install/upgrade the Firecrawl SDK that includes FirecrawlApp, or pass app=... in the constructor."
-            )
-
-        try:
-            # Start job
-            start_params: Dict[str, Any] = {"prompt": prompt}
-            if urls is not None:
-                start_params["urls"] = list(urls)
-            if model is not None:
-                start_params["model"] = model
-            if schema is not None:
-                start_params["schema"] = schema
-            start_params.update(kwargs)
-
-            job = self.app.start_agent(**start_params)
-            job_obj = self._to_dict(job)
-            job_id = job_obj.get("id") or job_obj.get("jobId") or job_obj.get("job_id")
-            if not job_id:
-                job_id = getattr(job, "id", None)
-
-            if not job_id:
-                return ToolResult.fail(
-                    f"agent_tool: could not determine job id from start_agent response: {job_obj}"
-                )
-
-            # Poll status until completed/failed/timeout
-            deadline = time.time() + float(timeout_s)
-            last_status: Optional[Dict[str, Any]] = None
-
-            while time.time() < deadline:
-                status = self.app.get_agent_status(job_id)
-                status_obj = self._to_dict(status)
-                last_status = status_obj
-
-                st = status_obj.get("status") or status_obj.get("state")
-                if st == "completed":
-                    return ToolResult.success(
-                        {
-                            "prompt": prompt,
-                            "job_id": job_id,
-                            "status": "completed",
-                            "data": status_obj.get("data"),
-                            "creditsUsed": status_obj.get("creditsUsed") or status_obj.get("credits_used"),
-                            "expiresAt": status_obj.get("expiresAt") or status_obj.get("expires_at"),
-                            "raw": status_obj,
-                        }
-                    )
-                if st == "failed":
-                    return ToolResult.fail(
-                        f"Firecrawl agent failed: {status_obj.get('error') or 'unknown error'}",
-                        None,
-                    )
-
-                time.sleep(float(poll_interval_s))
-
-            return ToolResult.fail(
-                f"agent_tool: timed out after {timeout_s}s. last_status={last_status}"
-            )
-        except Exception as e:
-            return ToolResult.fail("Firecrawl agent_tool failed", e)
-
-    # Backward-compatible wrappers if you still want them:
-
-    def agent(
-        self,
-        *,
-        prompt: str,
-        urls: Optional[Sequence[str]] = None,
-        schema: Optional[Union[Type[T], Dict[str, Any]]] = None,
-        model: Optional[str] = None,
-        **kwargs: Any,
-    ) -> ToolResult:
-        """
-        Direct agent() call (blocking) if your SDK supports it.
-        """
-        if self.app is None:
-            return ToolResult.fail(
-                "agent: FirecrawlApp is not available. Install/upgrade SDK or pass app=... in constructor."
-            )
-        try:
-            params: Dict[str, Any] = {"prompt": prompt}
-            if urls is not None:
-                params["urls"] = list(urls)
-            if schema is not None:
-                params["schema"] = schema
-            if model is not None:
-                params["model"] = model
-            params.update(kwargs)
-
-            res = self.app.agent(**params)
-            return ToolResult.success(self._to_dict(res))
-        except Exception as e:
-            return ToolResult.fail("Firecrawl agent failed", e)
-
-    def start_agent(self, *, prompt: str, urls: Optional[Sequence[str]] = None, **kwargs: Any) -> ToolResult:
-        if self.app is None:
-            return ToolResult.fail(
-                "start_agent: FirecrawlApp is not available. Install/upgrade SDK or pass app=... in constructor."
-            )
-        try:
-            params: Dict[str, Any] = {"prompt": prompt}
-            if urls is not None:
-                params["urls"] = list(urls)
-            params.update(kwargs)
-            job = self.app.start_agent(**params)
-            return ToolResult.success(self._to_dict(job))
-        except Exception as e:
-            return ToolResult.fail("Firecrawl start_agent failed", e)
-
-    def get_agent_status(self, agent_id: str, **kwargs: Any) -> ToolResult:
-        if self.app is None:
-            return ToolResult.fail(
-                "get_agent_status: FirecrawlApp is not available. Install/upgrade SDK or pass app=... in constructor."
-            )
-        try:
-            status = self.app.get_agent_status(agent_id, **kwargs)
-            return ToolResult.success(self._to_dict(status))
-        except Exception as e:
-            return ToolResult.fail(f"Firecrawl get_agent_status failed for id={agent_id!r}", e)
+if __name__ == "__main__":
+    raise SystemExit(main())
